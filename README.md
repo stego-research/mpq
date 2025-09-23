@@ -1,8 +1,8 @@
 # mpq
 
-![Build Status](https://github.com/icza/mpq/actions/workflows/go.yml/badge.svg)
-[![Go Reference](https://pkg.go.dev/badge/github.com/icza/mpq.svg)](https://pkg.go.dev/github.com/icza/mpq)
-[![Go Report Card](https://goreportcard.com/badge/github.com/icza/mpq)](https://goreportcard.com/report/github.com/icza/mpq)
+![Build Status](https://github.com/stego-research/mpq/actions/workflows/go.yml/badge.svg)
+[![Go Reference](https://pkg.go.dev/badge/github.com/stego-research/mpq.svg)](https://pkg.go.dev/github.com/stego-research/mpq)
+[![Go Report Card](https://goreportcard.com/badge/github.com/stego-research/mpq)](https://goreportcard.com/report/github.com/stego-research/mpq)
 [![codecov](https://codecov.io/gh/icza/mpq/branch/master/graph/badge.svg)](https://codecov.io/gh/icza/mpq)
 
 Package `mpq` is a decoder/parser of Blizzard's MPQ archive file format.
@@ -52,4 +52,4 @@ If you already have the MPQ data in memory:
 
 ## License
 
-Open-sourced under the [Apache License 2.0](https://github.com/icza/mpq/blob/master/LICENSE).
+Open-sourced under the [Apache License 2.0](https://github.com/stego-research/mpq/blob/master/LICENSE).
