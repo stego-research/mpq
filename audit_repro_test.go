@@ -81,3 +81,28 @@ func TestFileByHashRejectsOutOfRangeFileBlockIndex(t *testing.T) {
 	}
 	_ = err // nil or ErrInvalidArchive both acceptable; the point is no panic
 }
+
+// TestFileByHashRejectsOversizedOffsetTable pins the review fix that the packed
+// block offset table cannot be larger than the stored block. The table is read
+// from the front of the block; if it claims more entries than the block can
+// hold, the reads run past the block into unrelated archive bytes and yield
+// offsets from them. Here a compressed multi-sector block declares fileSize that
+// needs a 3-entry (12-byte) offset table inside an 8-byte stored block.
+func TestFileByHashRejectsOversizedOffsetTable(t *testing.T) {
+	m := &MPQ{
+		input:     bytes.NewReader(make([]byte, 8192)),
+		inputSize: 8192,
+		blockSize: 4096,
+	}
+	m.header.hashTableEntries = 1
+	m.hashTable = []hashEntry{{filePathHashA: 20, filePathHashB: 30, fileBlockIndex: 0}}
+	// fileSize 4097 -> blocksCount 2 -> 3-entry table (12 bytes) > blockSize 8.
+	m.blockTable = []blockEntry{{blockOffset: 0, blockSize: 8, fileSize: 4097, flags: beFlagFile | beFlagCompressedMulti}}
+	m.blockEntryIndices = []int{0}
+	m.filesCount = 1
+
+	data, err := m.FileByHash(0, 20, 30)
+	if err != ErrInvalidArchive || data != nil {
+		t.Fatalf("expected ErrInvalidArchive for oversized offset table, got data=%d bytes err=%v", len(data), err)
+	}
+}

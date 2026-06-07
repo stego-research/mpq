@@ -628,7 +628,10 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 		// out-of-range value would make the counter loop below read past
 		// m.blockTable (index-out-of-range panic) before the filesCount check
 		// downstream could reject it. A bogus index means the file is not present.
-		if int(hashEntry.fileBlockIndex) >= len(m.blockTable) {
+		// Compare as uint32 (len(blockTable) is bounded well under 2^20): an int()
+		// conversion would wrap a >MaxInt32 index to negative on 32-bit platforms
+		// and silently pass this check.
+		if hashEntry.fileBlockIndex >= uint32(len(m.blockTable)) {
 			return nil, nil
 		}
 
@@ -667,8 +670,10 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 		}
 		// fileSize bounds the make([]byte, fileSize) content allocation below; cap
 		// it relative to the archive and ensure it is a valid slice length (the
-		// latter guards a 32-bit make panic). (DoS guard.)
-		if int64(blockEntry.fileSize) > m.inputSize*maxFileExpansion || !fitsInt(blockEntry.fileSize) {
+		// latter guards a 32-bit make panic). blockSize must likewise fit an int:
+		// the per-sector inSize below is bounded by it, and int(inSize) would
+		// overflow to a negative make length on 32-bit otherwise. (DoS guard.)
+		if int64(blockEntry.fileSize) > m.inputSize*maxFileExpansion || !fitsInt(blockEntry.fileSize) || !fitsInt(blockEntry.blockSize) {
 			return nil, ErrInvalidArchive
 		}
 
@@ -690,6 +695,15 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 		in := m.input
 
 		if blockEntry.flags&beFlagCompressed != 0 && blockEntry.flags&beFlagSingle == 0 {
+			// The packed block offset table is stored at the front of the block, so
+			// it cannot be larger than the block itself; otherwise the reads below
+			// would run past the stored block into unrelated archive bytes, yielding
+			// offsets from those bytes. (The degenerate empty-file case has
+			// blocksCount == 0 and an unused table, so it is exempt. uint64 math
+			// avoids overflow in temp*4.)
+			if blocksCount > 0 && uint64(temp)*4 > uint64(blockEntry.blockSize) {
+				return nil, ErrInvalidArchive
+			}
 			// We need to load the packed block offset table, we will maintain this table for unpacked files too.
 			if _, err = in.Seek(blockOffsetBase, 0); err != nil {
 				return nil, ErrInvalidArchive
