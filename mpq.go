@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 )
 
@@ -175,7 +176,7 @@ type hashEntry struct {
 // and FileSize and Flags zero; unused block table entries should have BlockSize, FileSize, and Flags zero.
 // The block table is encrypted, using the hash of "(block table)" as the key.
 //
-// Extended block table
+// # Extended block table
 //
 // The extended block table was added to support archives larger than 4 gigabytes (2^32 bytes).
 // The table contains the upper bits of the archive offsets for each block in the block table.
@@ -310,6 +311,23 @@ func (m *MPQ) checkTableEntries(entries uint32) error {
 	return nil
 }
 
+// isPowerOfTwo reports whether n is a non-zero power of two. The hash table
+// size must satisfy this: file lookup masks the path hash with
+// (hashTableEntries-1), which is only a valid modulo for a power of two. A zero
+// count additionally underflows that mask to 0xFFFFFFFF and then panics when
+// indexing the (empty) hash table, so rejecting non-powers-of-two here also
+// closes that DoS.
+func isPowerOfTwo(n uint32) bool {
+	return n != 0 && n&(n-1) == 0
+}
+
+// fitsInt reports whether n is a safe length for make([]byte, n): make takes an
+// int, so on 32-bit platforms a uint32 above math.MaxInt converts to a negative
+// length and panics. On 64-bit this is always true (uint32 < math.MaxInt).
+func fitsInt(n uint32) bool {
+	return uint64(n) <= math.MaxInt
+}
+
 // NewFromFile returns a new MPQ using a file specified by its name as the input.
 // The returned MPQ must be closed with the Close method!
 // ErrInvalidArchive is returned if file exists and can be read, but is not a valid MPQ archive.
@@ -369,8 +387,9 @@ func (m *MPQ) diveIn() (*MPQ, error) {
 		read(&u.size)
 		read(&u.headerOffset)
 		// u.size bytes are about to be read into u.data; they cannot exceed the
-		// input length. Bound it before make([]byte, u.size) (DoS guard).
-		if err == nil && int64(u.size) > m.inputSize {
+		// input length, and must be a valid slice length for make (the latter
+		// guards a 32-bit make([]byte, u.size) panic). (DoS guard.)
+		if err == nil && (int64(u.size) > m.inputSize || !fitsInt(u.size)) {
 			return nil, ErrInvalidArchive
 		}
 		if err == nil {
@@ -433,6 +452,13 @@ func (m *MPQ) diveIn() (*MPQ, error) {
 		return nil, ErrInvalidArchive
 	}
 	m.blockSize = 512 << h.sectorSizeShift
+
+	// The hash table size must be a power of two (the format requires it, and the
+	// file lookup masks with hashTableEntries-1). This also rejects a zero count,
+	// which would otherwise underflow that mask and panic on lookup. (DoS guard.)
+	if !isPowerOfTwo(h.hashTableEntries) {
+		return nil, ErrInvalidArchive
+	}
 
 	// Bound the table entry counts before allocating buffers/slices from them.
 	// Each entry is 16 bytes on disk, so a table cannot have more entries than
@@ -558,7 +584,7 @@ func (m *MPQ) FilesCount() uint32 {
 //
 // Implementation note: this method returns:
 //
-//     MPQ.FileByHash(FileNameHash(name))
+//	MPQ.FileByHash(FileNameHash(name))
 //
 // If you need to call this frequently, it's profitable to store the hashes returned by
 // FileNameHash(), and call MPQ.FileByHash() directly passing the stored hashes.
@@ -626,7 +652,10 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 		if blockOffsetBase < 0 || blockOffsetBase+int64(blockEntry.blockSize) > m.inputSize {
 			return nil, ErrInvalidArchive
 		}
-		if int64(blockEntry.fileSize) > m.inputSize*maxFileExpansion {
+		// fileSize bounds the make([]byte, fileSize) content allocation below; cap
+		// it relative to the archive and ensure it is a valid slice length (the
+		// latter guards a 32-bit make panic). (DoS guard.)
+		if int64(blockEntry.fileSize) > m.inputSize*maxFileExpansion || !fitsInt(blockEntry.fileSize) {
 			return nil, ErrInvalidArchive
 		}
 
