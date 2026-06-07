@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 )
 
@@ -175,7 +176,7 @@ type hashEntry struct {
 // and FileSize and Flags zero; unused block table entries should have BlockSize, FileSize, and Flags zero.
 // The block table is encrypted, using the hash of "(block table)" as the key.
 //
-// Extended block table
+// # Extended block table
 //
 // The extended block table was added to support archives larger than 4 gigabytes (2^32 bytes).
 // The table contains the upper bits of the archive offsets for each block in the block table.
@@ -229,6 +230,10 @@ type MPQ struct {
 
 	// Derived data
 
+	// Total length of input in bytes, captured up-front and used to bound
+	// allocations against attacker-controlled header fields.
+	inputSize int64
+
 	blockSize uint32 // Size of the blocks.
 
 	blockEntryIndices []int // Block table entry indices of the files.
@@ -241,6 +246,87 @@ var userDataMagic = [4]byte{'M', 'P', 'Q', 0x1b}
 
 // Magic bytes of the mandatory MPQHeader section
 var headerMagic = [4]byte{'M', 'P', 'Q', 0x1a}
+
+// Defense-in-depth limits that bound memory allocations driven by
+// attacker-controlled header fields. Several sizes (the user-data size, the
+// hash/block table entry counts, a file's uncompressed size) are read straight
+// from the input and were previously used to size allocations before any
+// validation. A crafted archive only a few KB long could declare, e.g.,
+// hashTableEntries = 0x10000000 and force a multi-GB allocation
+// (CWE-789: memory allocation with excessive size; CWE-130: improper handling
+// of a length field). Together with per-field checks against the real input
+// length, these keep every allocation proportional to the actual input.
+const (
+	// maxTableEntries caps the hash/block table entry counts. The MPQ format
+	// documents the hash table as having fewer than 2^20 entries, and the block
+	// table is no larger in practice. Each entry is 16 bytes, so this also
+	// bounds the table read buffer at 16 MiB.
+	maxTableEntries = 1 << 20
+
+	// maxSectorSizeShift bounds header.sectorSizeShift. blockSize is
+	// 512 << sectorSizeShift; a large shift overflows the uint32 blockSize to 0,
+	// which is later used as a divisor (panic) and as a sector size. The format
+	// dictates this should be 3.
+	maxSectorSizeShift = 16
+
+	// maxFileExpansion bounds how much larger a single decompressed file may be
+	// than the entire archive that stores it. A genuine compressed file can be
+	// several times the archive size, but not unboundedly so; this rejects a
+	// block-table entry that claims, e.g., fileSize = 4 GiB inside a 4 KB
+	// archive before make([]byte, fileSize).
+	maxFileExpansion = 64
+)
+
+// inputLen reports the total length of the input without disturbing the current
+// read position. It lets diveIn validate header-declared sizes against the
+// bytes that actually exist, so a crafted field cannot drive an allocation
+// larger than the input itself.
+func inputLen(in io.ReadSeeker) (int64, error) {
+	cur, err := in.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	end, err := in.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = in.Seek(cur, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return end, nil
+}
+
+// checkTableEntries rejects a hash/block table entry count that is implausibly
+// large — either beyond the format's documented maximum or larger than could
+// physically fit (16 bytes each) in the input. This prevents a crafted header
+// from driving a multi-GB table allocation. uint64/int64 math avoids the
+// uint32 overflow the original `entries*16` expressions had.
+func (m *MPQ) checkTableEntries(entries uint32) error {
+	if entries > maxTableEntries {
+		return ErrInvalidArchive
+	}
+	if int64(entries)*16 > m.inputSize {
+		return ErrInvalidArchive
+	}
+	return nil
+}
+
+// isPowerOfTwo reports whether n is a non-zero power of two. The hash table
+// size must satisfy this: file lookup masks the path hash with
+// (hashTableEntries-1), which is only a valid modulo for a power of two. A zero
+// count additionally underflows that mask to 0xFFFFFFFF and then panics when
+// indexing the (empty) hash table, so rejecting non-powers-of-two here also
+// closes that DoS.
+func isPowerOfTwo(n uint32) bool {
+	return n != 0 && n&(n-1) == 0
+}
+
+// fitsInt reports whether n is a safe length for make([]byte, n): make takes an
+// int, so on 32-bit platforms a uint32 above math.MaxInt converts to a negative
+// length and panics. On 64-bit this is always true (uint32 < math.MaxInt).
+func fitsInt(n uint32) bool {
+	return uint64(n) <= math.MaxInt
+}
 
 // NewFromFile returns a new MPQ using a file specified by its name as the input.
 // The returned MPQ must be closed with the Close method!
@@ -273,6 +359,14 @@ func (m *MPQ) diveIn() (*MPQ, error) {
 
 	var err error
 
+	// Capture the real input length up-front; every size/entry-count field read
+	// from the (untrusted) header below is validated against it before it is
+	// used to size an allocation. This is the core guard against a tiny crafted
+	// archive forcing a huge allocation (DoS).
+	if m.inputSize, err = inputLen(in); err != nil {
+		return nil, ErrInvalidArchive
+	}
+
 	var magic [4]byte
 	if _, err = io.ReadFull(in, magic[:]); err != nil {
 		return nil, err
@@ -292,6 +386,12 @@ func (m *MPQ) diveIn() (*MPQ, error) {
 		u := userData{}
 		read(&u.size)
 		read(&u.headerOffset)
+		// u.size bytes are about to be read into u.data; they cannot exceed the
+		// input length, and must be a valid slice length for make (the latter
+		// guards a 32-bit make([]byte, u.size) panic). (DoS guard.)
+		if err == nil && (int64(u.size) > m.inputSize || !fitsInt(u.size)) {
+			return nil, ErrInvalidArchive
+		}
 		if err == nil {
 			u.data = make([]byte, u.size)
 			_, err = io.ReadFull(in, u.data)
@@ -345,10 +445,34 @@ func (m *MPQ) diveIn() (*MPQ, error) {
 
 	m.header = h
 
+	// blockSize is 512 << sectorSizeShift; reject a shift that would overflow it
+	// to zero (later used as a divisor — would panic) or to an implausibly large
+	// sector size.
+	if h.sectorSizeShift > maxSectorSizeShift {
+		return nil, ErrInvalidArchive
+	}
 	m.blockSize = 512 << h.sectorSizeShift
 
+	// The hash table size must be a power of two (the format requires it, and the
+	// file lookup masks with hashTableEntries-1). This also rejects a zero count,
+	// which would otherwise underflow that mask and panic on lookup. (DoS guard.)
+	if !isPowerOfTwo(h.hashTableEntries) {
+		return nil, ErrInvalidArchive
+	}
+
+	// Bound the table entry counts before allocating buffers/slices from them.
+	// Each entry is 16 bytes on disk, so a table cannot have more entries than
+	// fit in the input; an absolute cap backstops that. (DoS guard.)
+	if err = m.checkTableEntries(h.hashTableEntries); err != nil {
+		return nil, err
+	}
+	if err = m.checkTableEntries(h.blockTableEntries); err != nil {
+		return nil, err
+	}
+
 	// Create a big-enough buffer that is enough to read further hash and block tables to avoid reallocation:
-	// Size of both hash and block entries is 16 bytes
+	// Size of both hash and block entries is 16 bytes. Both counts are bounded
+	// above, so entries*16 (uint32) cannot overflow here.
 	var buf []byte
 	if h.hashTableEntries > h.blockTableEntries {
 		buf = make([]byte, h.hashTableEntries*16)
@@ -460,7 +584,7 @@ func (m *MPQ) FilesCount() uint32 {
 //
 // Implementation note: this method returns:
 //
-//     MPQ.FileByHash(FileNameHash(name))
+//	MPQ.FileByHash(FileNameHash(name))
 //
 // If you need to call this frequently, it's profitable to store the hashes returned by
 // FileNameHash(), and call MPQ.FileByHash() directly passing the stored hashes.
@@ -517,6 +641,22 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 		}
 		if m.userData != nil {
 			blockOffsetBase += int64(m.userData.headerOffset)
+		}
+
+		// blockSize (the packed/stored size) and fileSize (the uncompressed size)
+		// come from the attacker-controlled block table and drive the
+		// packedBlockOffsets and content allocations below. The stored bytes must
+		// physically exist within the archive, and a single decompressed file may
+		// not be unboundedly larger than the whole archive. Validate both before
+		// sizing any allocation from them. (DoS guard.)
+		if blockOffsetBase < 0 || blockOffsetBase+int64(blockEntry.blockSize) > m.inputSize {
+			return nil, ErrInvalidArchive
+		}
+		// fileSize bounds the make([]byte, fileSize) content allocation below; cap
+		// it relative to the archive and ensure it is a valid slice length (the
+		// latter guards a 32-bit make panic). (DoS guard.)
+		if int64(blockEntry.fileSize) > m.inputSize*maxFileExpansion || !fitsInt(blockEntry.fileSize) {
+			return nil, ErrInvalidArchive
 		}
 
 		var blocksCount uint32
