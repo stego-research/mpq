@@ -7,6 +7,8 @@
 
 Package `mpq` is a decoder/parser of Blizzard's MPQ archive file format.
 
+Forked from [the original](https://github.com/icza/mpq) by [Stego Research LLC](https://stego.ai).
+
 This is not a full MPQ implementation. It is primarily intended to parse StarCraft II replay files (`*.SC2Replay`),
 but that is fully supported.
 
