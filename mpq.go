@@ -602,7 +602,12 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 	hashTableEntries := m.header.hashTableEntries
 	var counter uint32
 
-	for i := h1 & (hashTableEntries - 1); ; i++ {
+	// Bound the probe sequence to the table size. The loop below only terminates
+	// on an empty (0xFFFFFFFF) entry, so a hash table whose every slot is
+	// occupied and non-matching would spin forever (a non-panic, non-recoverable
+	// hang) — and the hash table is attacker-controlled (encrypted with a fixed,
+	// known key). After visiting every entry the file is simply not present.
+	for i, probes := h1&(hashTableEntries-1), uint32(0); probes < hashTableEntries; i, probes = i+1, probes+1 {
 		if i == hashTableEntries {
 			i = 0
 		}
@@ -618,6 +623,14 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 		}
 
 		// FOUND!
+
+		// fileBlockIndex indexes the block table and is attacker-controlled. An
+		// out-of-range value would make the counter loop below read past
+		// m.blockTable (index-out-of-range panic) before the filesCount check
+		// downstream could reject it. A bogus index means the file is not present.
+		if int(hashEntry.fileBlockIndex) >= len(m.blockTable) {
+			return nil, nil
+		}
 
 		for j := uint32(0); j < hashEntry.fileBlockIndex; j++ {
 			if m.blockTable[j].flags&beFlagFile == 0 {
@@ -692,6 +705,10 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 			if blockEntry.flags&beFlagEncrypted != 0 {
 				return nil, ErrInvalidArchive // Decryption of packed block offset table is not yet implemented!
 			}
+			// Note: the packed block offset table is read straight from the archive
+			// and is therefore attacker-controlled; it is validated at point of use
+			// in the extraction loop below (offsets must be non-decreasing and within
+			// the stored block size) to keep the per-block inSize from underflowing.
 		} else {
 			if blockEntry.flags&beFlagSingle == 0 {
 				for k := uint32(0); k < blocksCount; k++ {
@@ -719,7 +736,14 @@ func (m *MPQ) FileByHash(h1, h2, h3 uint32) ([]byte, error) {
 				unpackedSize = blockEntry.fileSize - m.blockSize*k
 			}
 
-			// Read block
+			// Read block. The two consumed offsets are attacker-controlled (read
+			// from the archive); reject a non-monotonic pair — whose subtraction
+			// would underflow into a ~4 GB inSize/make — or one beyond the stored
+			// block size. (Programmatically filled offsets in the else branch above
+			// trivially satisfy this.)
+			if packedBlockOffsets[k+1] < packedBlockOffsets[k] || packedBlockOffsets[k+1] > blockEntry.blockSize {
+				return nil, ErrInvalidArchive
+			}
 			inSize := int(packedBlockOffsets[k+1] - packedBlockOffsets[k])
 			if _, err = in.Seek(blockOffsetBase+int64(packedBlockOffsets[k]), 0); err != nil {
 				return nil, ErrInvalidArchive

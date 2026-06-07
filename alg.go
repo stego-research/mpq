@@ -67,7 +67,10 @@ func decrypt(data []byte, key uint32) {
 	var seed2 = uint32(0xeeeeeeee)
 	var ch uint32
 
-	for i, size := 0, len(data); i < size; i += 4 {
+	// Process whole 4-byte words only; the loop reads data[i..i+3]. Callers pass
+	// 16-byte-aligned tables today, but bounding to full words keeps a future
+	// non-multiple-of-4 caller from reading past the slice (index-out-of-range).
+	for i, size := 0, len(data)&^3; i < size; i += 4 {
 		seed2 += cryptTable[0x400+(seed1&0xff)]
 
 		// littleEndian byte order:
@@ -110,6 +113,12 @@ func FileNameHash(name string) (h1, h2, h3 uint32) {
 
 // decompressMulti decompresses a block which was compressed using the multi compression method (beFlagCompressedMulti).
 func decompressMulti(dst, src []byte) error {
+	// An empty source carries no compression-flag byte; src[0] below would panic.
+	// A zero-length stored block for a non-empty output is malformed.
+	if len(src) == 0 {
+		return ErrInvalidArchive
+	}
+
 	// Check if block is really compressed, some blocks have set the compression flag, but are not compressed.
 	if len(src) >= len(dst) {
 		// Copy block
